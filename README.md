@@ -107,6 +107,27 @@ green once it can reach the backend. If it stays red/grey, check:
 
 ---
 
+## Accounts
+
+Anglers now sign up with a username and password instead of just typing a
+name. Passwords are hashed with Werkzeug's `generate_password_hash`
+(PBKDF2) — never stored in plaintext. Logging in issues a bearer token
+(`/api/auth/login`, `/api/auth/register`) that the frontend stores in
+`localStorage` and sends as `Authorization: Bearer <token>` on every
+request that needs to know who you are.
+
+This replaces the old "type any name" identity model. Creating a
+competition, joining one, submitting a catch, and ending a competition
+all now require a valid token, and the *username on that token* — not
+anything typed into a form — is what gets recorded as organizer or
+participant. That closes the gap the previous version's README called
+out: it's no longer possible to end someone else's competition, or log
+a catch under someone else's name, just by typing their name in a box.
+
+Sessions are simple opaque tokens in a `sessions` table (not JWTs), so
+"sign out" is a real server-side revocation (`/api/auth/logout` deletes
+the row) rather than just forgetting a token client-side.
+
 ## How the measuring tool works
 
 After uploading a photo, the angler clicks the two ends of a known length
@@ -132,13 +153,17 @@ or a service like SendGrid.
 
 | Method | Path | Purpose |
 |---|---|---|
+| POST | `/api/auth/register` | Create an account `{username, password}` → `{username, token}` |
+| POST | `/api/auth/login` | Log in `{username, password}` → `{username, token}` |
+| POST | `/api/auth/logout` | Revoke the current token (send `Authorization: Bearer <token>`) |
+| GET | `/api/auth/me` | Returns the logged-in username, or 401 |
 | GET | `/api/whoami` | Health check |
 | GET | `/api/competitions` | List all competitions (summary) |
 | POST | `/api/competitions` | Create a competition |
 | GET | `/api/competitions/<id>` | Full competition detail |
-| POST | `/api/competitions/<id>/join` | Sign up `{name}` |
-| POST | `/api/competitions/<id>/entries` | Submit a catch (multipart: `participant`, `length`, `image`) |
-| POST | `/api/competitions/<id>/end` | Organizer-only `{requester}` — ends comp, crowns winner |
+| POST | `/api/competitions/<id>/join` | Sign up (requires auth — signs up whoever's token this is) |
+| POST | `/api/competitions/<id>/entries` | Submit a catch (requires auth; multipart: `length`, `image`) |
+| POST | `/api/competitions/<id>/end` | Requires auth; only works if you're the organizer — ends comp, crowns winner |
 | GET | `/api/competitions/<id>/notifications` | Winner-announcement log |
 
 ## Environment variables (backend)
@@ -152,9 +177,9 @@ or a service like SendGrid.
 
 ## Known limitations
 
-- **No real authentication.** "Who you are" is just a typed name. Anyone
-  who types the organizer's name can end a competition — fine for a
-  friends-and-family tournament, not for anything adversarial.
+- **No password reset flow.** If someone forgets their password, the
+  only fix right now is deleting their row from the `users` table
+  directly in the DB.
 - **No outbound email/push** — see "winner announcements" above.
 - **SQLite + gunicorn**: the `Procfile` runs a single worker with
   multiple threads specifically to avoid SQLite locking issues under
