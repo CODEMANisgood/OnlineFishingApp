@@ -58,12 +58,26 @@
   nav.crumbs button{background:none;border:none;color:var(--sunrise-gold);padding:0;font-size:13px;text-decoration:underline;text-underline-offset:3px;}
   nav.crumbs button:hover{color:var(--cream);}
 
-  .who{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--cream-dim);}
+  .who{display:flex;align-items:center;gap:10px;font-size:13px;color:var(--cream-dim);}
   .who input{
     background:var(--navy-panel);border:1px solid var(--line-hair);color:var(--cream);
     border-radius:7px;padding:7px 10px;font-family:inherit;font-size:13px;width:150px;
   }
   .who input:focus{outline:2px solid var(--dock-green);outline-offset:1px;}
+  .account-badge{display:flex;align-items:center;gap:8px;font-size:13px;}
+  .account-badge .name{color:var(--cream);font-weight:600;}
+  .account-badge .logout{background:none;border:none;color:var(--sunrise-gold);text-decoration:underline;text-underline-offset:3px;font-size:12.5px;padding:0;}
+  .account-badge .logout:hover{color:var(--cream);}
+
+  .auth-modal-backdrop{position:fixed;inset:0;background:rgba(6,16,25,0.72);display:flex;align-items:center;justify-content:center;z-index:60;padding:20px;}
+  .auth-modal{background:var(--navy-panel);border:1px solid var(--line-hair);border-radius:var(--radius);padding:26px;width:100%;max-width:340px;box-shadow:var(--shadow);}
+  .auth-modal h2{margin:0 0 4px;font-size:20px;}
+  .auth-modal .sub{font-size:12.5px;color:var(--cream-dim);margin-bottom:18px;}
+  .auth-tabs{display:flex;gap:4px;background:var(--navy-deep);border-radius:8px;padding:3px;margin-bottom:18px;}
+  .auth-tab{flex:1;text-align:center;padding:7px 0;border-radius:6px;font-size:12.5px;font-weight:600;background:none;border:none;color:var(--cream-dim);}
+  .auth-tab.active{background:var(--dock-green);color:#052018;}
+  .auth-close{background:none;border:none;color:var(--cream-dim);font-size:13px;margin-top:10px;padding:0;text-decoration:underline;text-underline-offset:3px;}
+  .auth-close:hover{color:var(--cream);}
   .api-dot{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:6px;background:var(--cream-dim);}
   .api-dot.ok{background:var(--dock-green);}
   .api-dot.bad{background:var(--danger);}
@@ -168,23 +182,26 @@
    are served from the very same origin (e.g. testing locally with
    `python app.py`, which serves this file itself).
 ==================================================================== */
-const API = 'https://onlinefishingapp.onrender.com';
+const API = 'https://your-backend.onrender.com';
 /* ==================================================================== */
 
 /* ---------- tiny fetch helpers ---------- */
+function authHeaders(){
+  return state.token ? {'Authorization': 'Bearer '+state.token} : {};
+}
 async function apiGet(path){
-  const r = await fetch(API+path);
+  const r = await fetch(API+path, {headers: authHeaders()});
   if(!r.ok) throw new Error((await r.json().catch(()=>({error:r.statusText}))).error || 'Request failed');
   return r.json();
 }
 async function apiPost(path, body){
-  const r = await fetch(API+path, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  const r = await fetch(API+path, {method:'POST', headers:{'Content-Type':'application/json', ...authHeaders()}, body: JSON.stringify(body)});
   const data = await r.json().catch(()=>({}));
   if(!r.ok) throw new Error(data.error || 'Request failed');
   return data;
 }
 async function apiPostForm(path, formData){
-  const r = await fetch(API+path, {method:'POST', body: formData});
+  const r = await fetch(API+path, {method:'POST', headers: authHeaders(), body: formData});
   const data = await r.json().catch(()=>({}));
   if(!r.ok) throw new Error(data.error || 'Request failed');
   return data;
@@ -196,22 +213,56 @@ function fmtDate(d){ if(!d) return '—'; const dt = new Date(d.length>10 ? d : 
 function escapeHtml(s){ return String(s||'').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
 /* ---------- app state ---------- */
-let state = { view:'list', compId:null, myName: localStorage.getItem('reeldeal-name') || '', toast:null, apiOk:null };
+let state = {
+  view:'list', compId:null, toast:null, apiOk:null,
+  token: localStorage.getItem('reeldeal-token') || null,
+  myName: localStorage.getItem('reeldeal-username') || null,
+  showAuth:false, authMode:'login', authError:null, authBusy:false,
+  postLoginAction: null // optional callback run right after a successful login/register
+};
 let measure = { points:[], refLength:6, canvasEl:null, imgDataUrl:null, computedLength:null };
 
 function showToast(msg, isErr){ state.toast = {msg, isErr}; render(); setTimeout(()=>{ state.toast=null; render(); }, 3200); }
-function saveMyName(n){ state.myName = n; localStorage.setItem('reeldeal-name', n); }
+
+function setSession(username, token){
+  state.myName = username; state.token = token;
+  localStorage.setItem('reeldeal-username', username);
+  localStorage.setItem('reeldeal-token', token);
+}
+function clearSession(){
+  state.myName = null; state.token = null;
+  localStorage.removeItem('reeldeal-username');
+  localStorage.removeItem('reeldeal-token');
+}
+function openAuth(mode, afterLogin){
+  state.showAuth = true; state.authMode = mode || 'login'; state.authError = null;
+  state.postLoginAction = afterLogin || null;
+  render();
+}
+function closeAuth(){ state.showAuth = false; state.authError = null; state.postLoginAction = null; render(); }
+
+async function logout(){
+  try{ await apiPost('/api/auth/logout', {}); }catch(e){ /* token may already be invalid — fine either way */ }
+  clearSession();
+  showToast('Signed out.');
+}
 
 async function init(){
   try{ await apiGet('/api/whoami'); state.apiOk = true; } catch(e){ state.apiOk = false; }
+  // If we have a stored token, make sure it's still valid before trusting it.
+  if(state.token){
+    try{ await apiGet('/api/auth/me'); }
+    catch(e){ clearSession(); }
+  }
   render();
 }
 
 /* ---------- render router ---------- */
 function render(){
   const app = document.getElementById('app');
-  app.innerHTML = headerHtml() + toastHtml();
+  app.innerHTML = headerHtml() + toastHtml() + authModalHtml();
   attachHeaderEvents();
+  if(state.showAuth) attachAuthModalEvents();
   if(state.apiOk === false){
     document.getElementById('viewRoot').innerHTML = `<div class="empty-state panel">
       <div class="big">⚠️</div>
@@ -234,8 +285,14 @@ function headerHtml(){
     </div>
     <div class="who">
       <span><span class="api-dot ${state.apiOk===true?'ok':state.apiOk===false?'bad':''}"></span>API</span>
-      <span>Fishing as</span>
-      <input id="nameInput" type="text" placeholder="your name" value="${escapeHtml(state.myName)}">
+      ${state.myName ? `
+        <div class="account-badge">
+          <span>Fishing as</span> <span class="name">${escapeHtml(state.myName)}</span>
+          <button class="logout" id="logoutBtn">Sign out</button>
+        </div>
+      ` : `
+        <button class="btn btn-ghost" id="signInBtn">Sign in / Register</button>
+      `}
     </div>
   </header>
   <nav class="crumbs">
@@ -251,8 +308,60 @@ function toastHtml(){
 }
 function attachHeaderEvents(){
   document.getElementById('crumbHome').onclick = ()=>{ state.view='list'; state.compId=null; render(); };
-  const ni = document.getElementById('nameInput');
-  ni.onchange = ()=> saveMyName(ni.value.trim());
+  const signIn = document.getElementById('signInBtn');
+  if(signIn) signIn.onclick = ()=> openAuth('login');
+  const logoutBtn = document.getElementById('logoutBtn');
+  if(logoutBtn) logoutBtn.onclick = async ()=>{ await logout(); render(); };
+}
+
+/* ---------- AUTH MODAL ---------- */
+function authModalHtml(){
+  if(!state.showAuth) return '';
+  const mode = state.authMode;
+  return `
+  <div class="auth-modal-backdrop" id="authBackdrop">
+    <div class="auth-modal">
+      <h2>${mode==='login' ? 'Sign in' : 'Create your account'}</h2>
+      <div class="sub">${mode==='login' ? 'Sign in to join competitions and log catches.' : 'Anglers need an account to sign up for competitions or submit catches.'}</div>
+      <div class="auth-tabs">
+        <button class="auth-tab ${mode==='login'?'active':''}" id="tabLogin">Sign in</button>
+        <button class="auth-tab ${mode==='register'?'active':''}" id="tabRegister">Register</button>
+      </div>
+      <label for="authUsername">Username</label>
+      <input id="authUsername" type="text" placeholder="e.g. bass_master22" autocomplete="username">
+      <label for="authPassword">Password</label>
+      <input id="authPassword" type="password" placeholder="${mode==='register'?'at least 6 characters':'••••••••'}" autocomplete="${mode==='login'?'current-password':'new-password'}">
+      ${state.authError ? `<div class="error-text">${escapeHtml(state.authError)}</div>` : ''}
+      <button class="btn btn-primary btn-block" id="authSubmitBtn" ${state.authBusy?'disabled':''}>${state.authBusy ? 'Please wait…' : (mode==='login' ? 'Sign in' : 'Create account')}</button>
+      <div style="text-align:center;"><button class="auth-close" id="authCloseBtn">Cancel</button></div>
+    </div>
+  </div>`;
+}
+function attachAuthModalEvents(){
+  document.getElementById('tabLogin').onclick = ()=>{ state.authMode='login'; state.authError=null; render(); };
+  document.getElementById('tabRegister').onclick = ()=>{ state.authMode='register'; state.authError=null; render(); };
+  document.getElementById('authCloseBtn').onclick = closeAuth;
+  document.getElementById('authBackdrop').addEventListener('click', (e)=>{ if(e.target.id==='authBackdrop') closeAuth(); });
+  document.getElementById('authSubmitBtn').onclick = submitAuth;
+  document.getElementById('authPassword').addEventListener('keydown', (e)=>{ if(e.key==='Enter') submitAuth(); });
+}
+async function submitAuth(){
+  const username = document.getElementById('authUsername').value.trim();
+  const password = document.getElementById('authPassword').value;
+  if(!username || !password){ state.authError = 'Enter a username and password.'; render(); return; }
+  state.authBusy = true; state.authError = null; render();
+  try{
+    const path = state.authMode==='login' ? '/api/auth/login' : '/api/auth/register';
+    const data = await apiPost(path, {username, password});
+    setSession(data.username, data.token);
+    const after = state.postLoginAction;
+    state.showAuth = false; state.authBusy = false; state.postLoginAction = null;
+    showToast(state.authMode==='login' ? `Welcome back, ${data.username}!` : `Account created — welcome, ${data.username}!`);
+    if(after) after();
+    else render();
+  }catch(e){
+    state.authBusy = false; state.authError = e.message; render();
+  }
 }
 
 /* ---------- LIST ---------- */
@@ -290,10 +399,15 @@ async function renderList(){
 
 /* ---------- CREATE ---------- */
 function renderCreate(){
+  if(!state.myName){
+    openAuth('login', ()=>{ state.view='create'; render(); });
+    return;
+  }
   const root = document.getElementById('viewRoot');
   root.innerHTML = `
   <div class="panel" style="max-width:640px;">
     <h2 style="margin-top:0;">Post a new competition</h2>
+    <div class="hint" style="margin-top:-6px;">You'll be listed as the organizer (${escapeHtml(state.myName)}) — only you can close this competition and post the winner.</div>
     <label for="cTitle">Competition name</label>
     <input id="cTitle" type="text" placeholder="e.g. Autumn Bass Classic">
     <div class="row2">
@@ -308,9 +422,6 @@ function renderCreate(){
       <div><label for="cStart">Start date</label><input id="cStart" type="date" value="${todayISO()}"></div>
       <div><label for="cEnd">End date</label><input id="cEnd" type="date"></div>
     </div>
-    <label for="cOrganizer">Your name (organizer)</label>
-    <input id="cOrganizer" type="text" value="${escapeHtml(state.myName)}" placeholder="who's running this?">
-    <div class="hint">Only the organizer can close the competition and post the winner.</div>
     <div class="row2">
       <div><label for="cRefLabel">Ruler reference label</label><input id="cRefLabel" type="text" value="6 inch mark" placeholder="e.g. 6 inch mark"></div>
       <div><label for="cUnit">Measurement unit</label><select id="cUnit"><option value="in">inches</option><option value="cm">centimeters</option></select></div>
@@ -325,14 +436,13 @@ function renderCreate(){
   document.getElementById('cancelCompBtn').onclick = ()=>{ state.view='list'; render(); };
   document.getElementById('submitCompBtn').onclick = async ()=>{
     const title = document.getElementById('cTitle').value.trim();
-    const organizer = document.getElementById('cOrganizer').value.trim();
     const endDate = document.getElementById('cEnd').value;
-    if(!title || !organizer || !endDate){ showToast('Please fill in a title, organizer name, and end date.', true); return; }
+    if(!title || !endDate){ showToast('Please fill in a title and end date.', true); return; }
     const btn = document.getElementById('submitCompBtn');
     btn.disabled = true; btn.textContent = 'Posting…';
     try{
       const comp = await apiPost('/api/competitions', {
-        title, organizer,
+        title,
         species: document.getElementById('cSpecies').value.trim(),
         waterBody: document.getElementById('cWater').value.trim(),
         description: document.getElementById('cDesc').value.trim(),
@@ -342,7 +452,6 @@ function renderCreate(){
         refLabel: document.getElementById('cRefLabel').value.trim(),
         refUnit: document.getElementById('cUnit').value
       });
-      if(!state.myName) saveMyName(organizer);
       state.view='detail'; state.compId=comp.id;
       render();
       showToast('Competition posted!');
@@ -399,12 +508,12 @@ async function renderDetail(){
     ${comp.status==='open' ? `
     <div class="section-title">Join & submit a catch</div>
     <div class="panel" style="margin-bottom:20px;">
-      ${!isJoined ? `
-        <label for="joinName">Sign up as</label>
-        <div style="display:flex;gap:10px;">
-          <input id="joinName" type="text" value="${escapeHtml(state.myName)}" placeholder="your name" style="margin-bottom:0;">
-          <button class="btn btn-green" id="joinBtn">Join competition</button>
-        </div>
+      ${!state.myName ? `
+        <p style="margin:0 0 14px;color:var(--cream-dim);font-size:13.5px;">Sign in to join this competition and log a catch.</p>
+        <button class="btn btn-green" id="joinSignInBtn">Sign in / Register</button>
+      ` : !isJoined ? `
+        <p style="margin:0 0 14px;color:var(--cream-dim);font-size:13.5px;">Join as <strong style="color:var(--cream);">${escapeHtml(state.myName)}</strong>.</p>
+        <button class="btn btn-green" id="joinBtn">Join competition</button>
       ` : `<p style="margin:0 0 14px;color:var(--dock-green);font-weight:600;">✓ You're signed up, ${escapeHtml(state.myName)}. Good luck out there.</p>
         <button class="btn btn-primary" id="openMeasureBtn">📷 Upload catch photo & measure</button>`}
     </div>
@@ -415,14 +524,14 @@ async function renderDetail(){
   if(comp.status==='open' && isOrganizer){
     document.getElementById('endCompBtn').onclick = ()=> endCompetition(comp);
   }
-  if(comp.status==='open' && !isJoined){
+  if(comp.status==='open' && !state.myName){
+    document.getElementById('joinSignInBtn').onclick = ()=> openAuth('login', ()=> renderDetail());
+  }
+  if(comp.status==='open' && state.myName && !isJoined){
     document.getElementById('joinBtn').onclick = async ()=>{
-      const name = document.getElementById('joinName').value.trim();
-      if(!name){ showToast('Enter a name to sign up.', true); return; }
       try{
-        saveMyName(name);
-        await apiPost('/api/competitions/'+comp.id+'/join', {name});
-        showToast(`Signed up as ${name}!`);
+        await apiPost('/api/competitions/'+comp.id+'/join', {});
+        showToast(`Signed up as ${state.myName}!`);
         renderDetail();
       }catch(e){ showToast(e.message, true); }
     };
@@ -455,7 +564,7 @@ async function endCompetition(comp){
   if(comp.entries.length===0){ showToast('No entries logged — nothing to crown yet.', true); return; }
   if(!confirm(`End "${comp.title}" and post the winner to all ${comp.participants.length} anglers? This can't be undone.`)) return;
   try{
-    await apiPost('/api/competitions/'+comp.id+'/end', {requester: state.myName});
+    await apiPost('/api/competitions/'+comp.id+'/end', {});
     showToast('Winner posted! 🏆');
     renderDetail();
   }catch(e){ showToast(e.message, true); }
@@ -606,7 +715,6 @@ async function submitEntry(comp){
   btn.disabled = true; btn.textContent = 'Submitting…';
   try{
     const form = new FormData();
-    form.append('participant', state.myName);
     form.append('length', measure.computedLength.toFixed(3));
     form.append('image', dataUrlToBlob(measure.imgDataUrl), 'catch.jpg');
     await apiPostForm('/api/competitions/'+comp.id+'/entries', form);
