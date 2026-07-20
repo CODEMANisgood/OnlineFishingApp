@@ -28,12 +28,14 @@ Environment variables (all optional):
     FLASK_DEBUG    Set to "1" to enable Flask's debug/reload mode locally.
 """
 import os
+import secrets
 import sqlite3
 import uuid
 from datetime import datetime, date, timezone
 
 from flask import Flask, request, jsonify, send_from_directory, g, abort
 from flask_cors import CORS
+from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
 from PIL import Image
 
@@ -51,10 +53,13 @@ app = Flask(__name__, static_folder="static", static_url_path="")
 
 _origins_env = os.environ.get("CORS_ORIGINS", "*").strip()
 CORS_ORIGINS = "*" if _origins_env == "*" else [o.strip() for o in _origins_env.split(",") if o.strip()]
-# supports_credentials is off because the app uses no cookies/sessions —
-# anglers are identified by a plain name field, so a wildcard origin is safe
-# here as long as you don't later add cookie-based auth.
-CORS(app, resources={r"/api/*": {"origins": CORS_ORIGINS}, r"/uploads/*": {"origins": CORS_ORIGINS}})
+# supports_credentials is off because auth uses a bearer token (Authorization
+# header) rather than cookies, so a wildcard origin is still safe here — just
+# don't switch this to cookie-based sessions without locking CORS_ORIGINS down.
+CORS(app, resources={
+    r"/api/*": {"origins": CORS_ORIGINS, "allow_headers": ["Content-Type", "Authorization"]},
+    r"/uploads/*": {"origins": CORS_ORIGINS},
+})
 
 app.config["MAX_CONTENT_LENGTH"] = 12 * 1024 * 1024  # 12 MB request cap
 
@@ -82,6 +87,20 @@ def init_db():
     db = sqlite3.connect(DB_PATH)
     db.executescript(
         """
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL,
+            password_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(username COLLATE NOCASE)
+        );
+
+        CREATE TABLE IF NOT EXISTS sessions (
+            token TEXT PRIMARY KEY,
+            username TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS competitions (
             id TEXT PRIMARY KEY,
             title TEXT NOT NULL,
@@ -221,6 +240,50 @@ def allowed_file(filename):
     return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXT
 
 
+# ---------------------------------------------------------------- auth
+
+def create_session(username):
+    """Issue a new bearer token for a (already-verified) username."""
+    token = secrets.token_hex(32)
+    db = get_db()
+    db.execute(
+        "INSERT INTO sessions (token, username, created_at) VALUES (?,?,?)",
+        (token, username, now_iso()),
+    )
+    db.commit()
+    return token
+
+
+def username_from_token(token):
+    if not token:
+        return None
+    db = get_db()
+    row = db.execute(
+        """SELECT u.username FROM sessions s
+           JOIN users u ON u.username = s.username
+           WHERE s.token = ?""",
+        (token,),
+    ).fetchone()
+    return row["username"] if row else None
+
+
+def bearer_token():
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        return auth[7:].strip()
+    return None
+
+
+def require_auth():
+    """Returns the logged-in username, or aborts 401 if the request has no
+    valid session token. Call this at the top of any route that should only
+    be doable by a logged-in angler."""
+    username = username_from_token(bearer_token())
+    if not username:
+        abort(401, description="Login required")
+    return username
+
+
 # ---------------------------------------------------------------- routes: frontend
 
 @app.route("/")
@@ -231,6 +294,69 @@ def index():
 @app.route("/uploads/<path:filename>")
 def uploaded_file(filename):
     return send_from_directory(UPLOAD_DIR, filename)
+
+
+# ---------------------------------------------------------------- routes: auth
+
+@app.post("/api/auth/register")
+def register():
+    data = request.get_json(force=True, silent=True) or {}
+    username = (data.get("username") or "").strip()
+    password = data.get("password") or ""
+    if len(username) < 3 or len(username) > 30:
+        return jsonify({"error": "username must be 3-30 characters"}), 400
+    if not all(c.isalnum() or c in "_-" for c in username):
+        return jsonify({"error": "username can only contain letters, numbers, - and _"}), 400
+    if len(password) < 6:
+        return jsonify({"error": "password must be at least 6 characters"}), 400
+
+    db = get_db()
+    existing = db.execute(
+        "SELECT 1 FROM users WHERE username = ? COLLATE NOCASE", (username,)
+    ).fetchone()
+    if existing:
+        return jsonify({"error": "that username is already taken"}), 409
+
+    db.execute(
+        "INSERT INTO users (username, password_hash, created_at) VALUES (?,?,?)",
+        (username, generate_password_hash(password), now_iso()),
+    )
+    db.commit()
+    token = create_session(username)
+    return jsonify({"username": username, "token": token}), 201
+
+
+@app.post("/api/auth/login")
+def login():
+    data = request.get_json(force=True, silent=True) or {}
+    username = (data.get("username") or "").strip()
+    password = data.get("password") or ""
+
+    db = get_db()
+    row = db.execute(
+        "SELECT * FROM users WHERE username = ? COLLATE NOCASE", (username,)
+    ).fetchone()
+    if row is None or not check_password_hash(row["password_hash"], password):
+        return jsonify({"error": "invalid username or password"}), 401
+
+    token = create_session(row["username"])
+    return jsonify({"username": row["username"], "token": token})
+
+
+@app.post("/api/auth/logout")
+def logout():
+    token = bearer_token()
+    if token:
+        db = get_db()
+        db.execute("DELETE FROM sessions WHERE token = ?", (token,))
+        db.commit()
+    return jsonify({"ok": True})
+
+
+@app.get("/api/auth/me")
+def me():
+    username = require_auth()
+    return jsonify({"username": username})
 
 
 # ---------------------------------------------------------------- routes: API
@@ -244,12 +370,12 @@ def list_competitions():
 
 @app.post("/api/competitions")
 def create_competition():
+    organizer = require_auth()
     data = request.get_json(force=True, silent=True) or {}
     title = (data.get("title") or "").strip()
-    organizer = (data.get("organizer") or "").strip()
     end_date = (data.get("endDate") or "").strip()
-    if not title or not organizer or not end_date:
-        return jsonify({"error": "title, organizer, and endDate are required"}), 400
+    if not title or not end_date:
+        return jsonify({"error": "title and endDate are required"}), 400
 
     comp_id = uuid.uuid4().hex[:12]
     db = get_db()
@@ -287,13 +413,10 @@ def get_competition(comp_id):
 
 @app.post("/api/competitions/<comp_id>/join")
 def join_competition(comp_id):
+    name = require_auth()
     row = get_competition_row(comp_id)
     if row["status"] != "open":
         return jsonify({"error": "This competition has ended."}), 400
-    data = request.get_json(force=True, silent=True) or {}
-    name = (data.get("name") or "").strip()
-    if not name:
-        return jsonify({"error": "name is required"}), 400
     db = get_db()
     try:
         db.execute(
@@ -308,16 +431,16 @@ def join_competition(comp_id):
 
 @app.post("/api/competitions/<comp_id>/entries")
 def submit_entry(comp_id):
+    participant = require_auth()
     row = get_competition_row(comp_id)
     if row["status"] != "open":
         return jsonify({"error": "This competition has ended."}), 400
 
-    participant = (request.form.get("participant") or "").strip()
     length_raw = request.form.get("length")
     image = request.files.get("image")
 
-    if not participant or not length_raw or image is None:
-        return jsonify({"error": "participant, length, and image are required"}), 400
+    if not length_raw or image is None:
+        return jsonify({"error": "length and image are required"}), 400
     try:
         length = float(length_raw)
         if length <= 0 or length > 1000:
@@ -362,11 +485,10 @@ def submit_entry(comp_id):
 
 @app.post("/api/competitions/<comp_id>/end")
 def end_competition(comp_id):
+    requester = require_auth()
     row = get_competition_row(comp_id)
     if row["status"] != "open":
         return jsonify({"error": "Competition already ended."}), 400
-    data = request.get_json(force=True, silent=True) or {}
-    requester = (data.get("requester") or "").strip()
     if requester.lower() != row["organizer"].lower():
         return jsonify({"error": "only the organizer can end this competition"}), 403
 
@@ -420,6 +542,11 @@ def list_notifications(comp_id):
 def whoami():
     # Simple echo endpoint the frontend can ping to confirm the API is reachable.
     return jsonify({"ok": True, "time": now_iso()})
+
+
+@app.errorhandler(401)
+def unauthorized(e):
+    return jsonify({"error": str(e.description) if hasattr(e, "description") else "login required"}), 401
 
 
 @app.errorhandler(404)
